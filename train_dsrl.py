@@ -18,7 +18,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from env_utils import DiffusionPolicyEnvWrapper, ObservationWrapperRobomimic, ObservationWrapperGym, ActionChunkWrapper, make_robomimic_env
-from utils import load_base_policy, load_offline_data, collect_rollouts, LoggingCallback
+from utils import ensure_dsrl_assets, load_base_policy, load_offline_data, collect_rollouts, LoggingCallback
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 OmegaConf.register_new_resolver("round_up", math.ceil)
@@ -62,6 +62,7 @@ def main(cfg: OmegaConf):
 		env = ActionChunkWrapper(env, cfg, max_episode_steps=cfg.env.max_episode_steps)
 		return env
 
+	ensure_dsrl_assets(cfg)
 	base_policy = load_base_policy(cfg)
 	env = make_vec_env(make_env, n_envs=num_env, vec_env_cls=SubprocVecEnv)
 	if cfg.algorithm == 'dsrl_sac':
@@ -164,7 +165,6 @@ def main(cfg: OmegaConf):
 	logging_callback.evaluate(model, deterministic=False)
 	if cfg.deterministic_eval:
 		logging_callback.evaluate(model, deterministic=True)
-	logging_callback.log_count += 1
 
 	if cfg.load_offline_data:
 		load_offline_data(model, cfg.offline_data_path, num_env)

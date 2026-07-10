@@ -141,14 +141,15 @@ class ActionChunkWrapper(gymnasium.Env):
 		self.max_episode_steps = max_episode_steps
 		self.env = env
 		self.act_steps = cfg.act_steps
+		obs_dim = getattr(cfg, "base_obs_dim", cfg.obs_dim)
 		self.action_space = spaces.Box(
 			low=np.tile(env.action_space.low, cfg.act_steps),
 			high=np.tile(env.action_space.high, cfg.act_steps),
 			dtype=np.float32
 		)
 		self.observation_space = spaces.Box(
-			low=-np.ones(cfg.obs_dim),
-			high=np.ones(cfg.obs_dim),
+			low=-np.ones(obs_dim),
+			high=np.ones(obs_dim),
 			dtype=np.float32
 		)
 		self.count = 0
@@ -228,4 +229,127 @@ class DiffusionPolicyEnvWrapper(VecEnvWrapper):
 		self.obs = torch.tensor(obs, device=self.device, dtype=torch.float32)
 		obs_out = self.obs
 		return obs_out.detach().cpu().numpy()
-	
+
+
+class ResidualPolicyEnvWrapper(VecEnvWrapper):
+	def __init__(self, env, cfg, base_policy):
+		super().__init__(env)
+		self.action_horizon = cfg.act_steps
+		self.action_dim = cfg.action_dim
+		self.base_obs_dim = cfg.base_obs_dim
+		self.residual_scale = cfg.train.residual_scale
+		self.base_noise_mode = cfg.train.get("base_noise_mode", "random")
+		self.device = cfg.device
+		self.base_policy = base_policy
+		self.raw_obs = None
+		self.last_base_action = None
+
+		action_len = self.action_dim * self.action_horizon
+		self.action_space = spaces.Box(
+			low=-cfg.train.action_magnitude * np.ones(action_len),
+			high=cfg.train.action_magnitude * np.ones(action_len),
+			dtype=np.float32,
+		)
+		aug_obs_dim = self.base_obs_dim + action_len
+		self.observation_space = spaces.Box(
+			low=-np.inf * np.ones(aug_obs_dim),
+			high=np.inf * np.ones(aug_obs_dim),
+			dtype=np.float32,
+		)
+
+	def _sample_base_noise(self, batch_size):
+		noise = torch.randn(
+			batch_size, self.action_horizon, self.action_dim, device=self.device
+		)
+		if self.base_noise_mode == "zero":
+			noise = torch.zeros_like(noise)
+		return noise
+
+	def _compute_base_action(self, raw_obs):
+		noise = self._sample_base_noise(raw_obs.shape[0])
+		return self.base_policy(raw_obs, noise, return_numpy=False)
+
+	def _augment_obs(self, raw_obs, base_action):
+		flat = base_action.reshape(base_action.shape[0], -1)
+		if isinstance(raw_obs, torch.Tensor):
+			return torch.cat([raw_obs, flat], dim=1)
+		return np.concatenate([raw_obs, flat.detach().cpu().numpy()], axis=1)
+
+	def _augment_terminal_obs(self, infos):
+		for info in infos:
+			if "terminal_observation" not in info:
+				continue
+			term_raw = torch.tensor(
+				info["terminal_observation"][None],
+				device=self.device,
+				dtype=torch.float32,
+			)
+			term_base = self._compute_base_action(term_raw)
+			info["terminal_observation"] = (
+				self._augment_obs(term_raw, term_base)[0].detach().cpu().numpy()
+			)
+
+	def step_async(self, actions):
+		residual = torch.tensor(actions, device=self.device, dtype=torch.float32)
+		residual = residual.view(-1, self.action_horizon, self.action_dim)
+		final_action = self.last_base_action + self.residual_scale * residual
+		self.venv.step_async(final_action.detach().cpu().numpy())
+
+	def step_wait(self):
+		obs, rewards, dones, infos = self.venv.step_wait()
+		self.raw_obs = torch.tensor(obs, device=self.device, dtype=torch.float32)
+		self.last_base_action = self._compute_base_action(self.raw_obs)
+		obs_out = self._augment_obs(self.raw_obs, self.last_base_action)
+		self._augment_terminal_obs(infos)
+		return obs_out.detach().cpu().numpy(), rewards, dones, infos
+
+	def reset(self):
+		obs = self.venv.reset()
+		self.raw_obs = torch.tensor(obs, device=self.device, dtype=torch.float32)
+		self.last_base_action = self._compute_base_action(self.raw_obs)
+		obs_out = self._augment_obs(self.raw_obs, self.last_base_action)
+		return obs_out.detach().cpu().numpy()
+
+	def get_base_action_flat(self):
+		if self.last_base_action is None:
+			return None
+		return (
+			self.last_base_action.reshape(self.last_base_action.shape[0], -1)
+			.detach()
+			.cpu()
+			.numpy()
+		)
+
+
+class ResidualBasisPolicyEnvWrapper(ResidualPolicyEnvWrapper):
+	def __init__(self, env, cfg, base_policy):
+		self.n_basis = cfg.train.n_basis
+		self.basis_V = None
+		super().__init__(env, cfg, base_policy)
+		self.action_space = spaces.Box(
+			low=-cfg.train.action_magnitude * np.ones(self.n_basis),
+			high=cfg.train.action_magnitude * np.ones(self.n_basis),
+			dtype=np.float32,
+		)
+
+	def set_basis(self, V):
+		self.basis_V = np.asarray(V, dtype=np.float32)
+
+	def _basis_to_residual(self, actions):
+		actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+		if actions.ndim == 1:
+			actions = actions.unsqueeze(0)
+		action_len = self.action_horizon * self.action_dim
+		if self.basis_V is None:
+			return torch.zeros(
+				actions.shape[0], action_len, device=self.device, dtype=torch.float32
+			)
+		V = torch.as_tensor(self.basis_V, device=self.device, dtype=torch.float32)
+		return actions @ V.T
+
+	def step_async(self, actions):
+		residual_flat = self._basis_to_residual(actions)
+		residual = residual_flat.view(-1, self.action_horizon, self.action_dim)
+		final_action = self.last_base_action + self.residual_scale * residual
+		self.venv.step_async(final_action.detach().cpu().numpy())
+
