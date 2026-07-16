@@ -18,7 +18,12 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 sys.path.append("./dppo")
 
-from action_eigenspace import fit_action_basis, load_action_basis, save_action_basis
+from action_eigenspace import (
+	fit_action_basis,
+	load_action_basis,
+	make_random_basis,
+	save_action_basis,
+)
 from env_utils import (
 	ActionChunkWrapper,
 	ObservationWrapperGym,
@@ -26,7 +31,7 @@ from env_utils import (
 	ResidualBasisPolicyEnvWrapper,
 	make_robomimic_env,
 )
-from residual_config import build_residual_config, parse_residual_basis_args
+from residual_config import build_residual_config, parse_residual_basis_args, wandb_config_from_cfg
 from utils import (
 	LoggingCallback,
 	collect_base_actions,
@@ -79,7 +84,7 @@ def main():
 			group=cfg.wandb.group,
 			monitor_gym=True,
 			save_code=True,
-			config=dict(cfg),
+			config=wandb_config_from_cfg(cfg, basis=True),
 		)
 
 	max_steps = int(cfg.env.max_episode_steps / cfg.act_steps)
@@ -99,11 +104,27 @@ def main():
 	eval_env = ResidualBasisPolicyEnvWrapper(eval_env, cfg, base_policy)
 	eval_env.seed(cfg.seed + num_env + 1)
 
-	if cfg.train.basis_path:
-		V, explained_ratio = load_action_basis(cfg.train.basis_path, n_basis=cfg.train.n_basis)
-		basis_source = "file"
+	basis_source = cfg.train.basis_source
+	if basis_source == "file":
+		V, explained_ratio = load_action_basis(
+			cfg.train.basis_path, n_basis=cfg.train.n_basis
+		)
 		print(f"Loaded basis from {cfg.train.basis_path} with shape {V.shape}")
-	else:
+	elif basis_source == "random":
+		V, explained_ratio = make_random_basis(
+			action_len, cfg.train.n_basis, seed=cfg.seed
+		)
+		basis_out = os.path.join(cfg.logdir, "action_basis_random.npz")
+		save_action_basis(
+			basis_out,
+			V,
+			explained_ratio,
+			env_name=cfg.env_name,
+			source="random",
+			seed=cfg.seed,
+		)
+		print(f"Built random QR basis with shape {V.shape}, saved to {basis_out}")
+	elif basis_source == "rollout":
 		fit_env = make_vec_env(make_env, n_envs=1, vec_env_cls=SubprocVecEnv)
 		fit_env = ResidualBasisPolicyEnvWrapper(fit_env, cfg, base_policy)
 		base_actions = collect_base_actions(
@@ -111,7 +132,6 @@ def main():
 		)
 		fit_env.close()
 		V, explained_ratio = fit_action_basis(base_actions, cfg.train.n_basis)
-		basis_source = "rollout"
 		basis_out = os.path.join(cfg.logdir, "action_basis.npz")
 		save_action_basis(
 			basis_out,
@@ -119,12 +139,20 @@ def main():
 			explained_ratio,
 			env_name=cfg.env_name,
 			n_rollouts=cfg.train.basis_fit_rollouts,
+			source="rollout",
 		)
 		print(f"Fitted basis from {base_actions.shape[0]} samples, saved to {basis_out}")
+	else:
+		raise ValueError(f"Unknown basis_source={basis_source!r}")
 
 	if V.shape[0] != action_len:
 		raise ValueError(
 			f"Basis feature dim {V.shape[0]} != act_steps * action_dim ({action_len})"
+		)
+	if V.shape[1] != cfg.train.n_basis:
+		raise ValueError(
+			f"Basis has {V.shape[1]} columns but n_basis={cfg.train.n_basis}. "
+			"Use matching --n-basis, or regenerate the basis."
 		)
 
 	env.set_basis(V)

@@ -65,6 +65,17 @@ def add_basis_args(parser: argparse.ArgumentParser) -> None:
 		default="",
 		help="Optional path to a precomputed action basis .npz",
 	)
+	parser.add_argument(
+		"--basis-source",
+		type=str,
+		default="auto",
+		choices=["auto", "rollout", "file", "random"],
+		help=(
+			"How to obtain the residual basis. "
+			"'auto' uses file if --basis-path is set, else rollout PCA. "
+			"'random' uses a QR orthonormal random basis (ablation)."
+		),
+	)
 
 
 def parse_residual_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -197,6 +208,50 @@ def build_residual_config(args: argparse.Namespace, basis: bool = False) -> Omeg
 	}
 
 	if basis:
-		cfg_dict["train"]["basis_path"] = args.basis_path or None
+		basis_path = args.basis_path or None
+		basis_source = args.basis_source
+		if basis_source == "auto":
+			basis_source = "file" if basis_path else "rollout"
+		if basis_source == "file" and not basis_path:
+			raise ValueError("--basis-source file requires --basis-path")
+		cfg_dict["train"]["basis_path"] = basis_path
+		cfg_dict["train"]["basis_source"] = basis_source
+		# Keep random / PCA / file runs in distinct wandb groups.
+		if basis_source == "random":
+			cfg_dict["wandb"]["group"] = f"robomimic-{args.env_name}-residual-basis-random"
+		elif basis_source == "rollout":
+			cfg_dict["wandb"]["group"] = f"robomimic-{args.env_name}-residual-basis-pca"
+		elif basis_source == "file":
+			cfg_dict["wandb"]["group"] = f"robomimic-{args.env_name}-residual-basis-file"
 
 	return OmegaConf.create(cfg_dict)
+
+
+def wandb_config_from_cfg(cfg, basis: bool = False) -> dict:
+	"""Flat hyperparameter dict for wandb (one scalar per config field)."""
+	flat = {
+		"env_name": cfg.env_name,
+		"seed": cfg.seed,
+		"device": cfg.device,
+		"base_obs_dim": cfg.base_obs_dim,
+		"obs_dim": cfg.obs_dim,
+		"action_dim": cfg.action_dim,
+		"act_steps": cfg.act_steps,
+		"cond_steps": cfg.cond_steps,
+		"logdir": cfg.logdir,
+		"base_policy_path": cfg.base_policy_path,
+		"eval_interval": cfg.eval_interval,
+		"num_evals": cfg.num_evals,
+		"save_model_interval": cfg.save_model_interval,
+		"save_replay_buffer": cfg.save_replay_buffer,
+		"deterministic_eval": cfg.deterministic_eval,
+		"env/n_envs": cfg.env.n_envs,
+		"env/n_eval_envs": cfg.env.n_eval_envs,
+		"env/max_episode_steps": cfg.env.max_episode_steps,
+		"env/reward_offset": cfg.env.reward_offset,
+		"wandb/group": cfg.wandb.group,
+		"algorithm": "residual_basis_sac" if basis else "residual_sac",
+	}
+	for key, value in dict(cfg.train).items():
+		flat[f"train/{key}"] = value
+	return flat

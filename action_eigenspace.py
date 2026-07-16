@@ -16,6 +16,18 @@ def fit_action_basis(data, n_components):
 	)
 
 
+def make_random_basis(feature_dim, n_components, seed=None):
+	"""Random orthonormal basis via QR. Returns V (D, k), uniform explained ratios."""
+	k = min(n_components, feature_dim)
+	if k <= 0:
+		raise ValueError(f"n_components must be > 0, got {n_components}")
+	rng = np.random.default_rng(seed)
+	Q, _ = np.linalg.qr(rng.normal(size=(feature_dim, k)))
+	V = Q[:, :k].astype(np.float32)
+	explained = np.full(k, 1.0 / k, dtype=np.float32)
+	return V, explained
+
+
 def cumulative_explained_variance(data, max_components=None):
 	"""Return (n_components, cumulative_variance) for plotting."""
 	centered = data - data.mean(axis=0)
